@@ -38,7 +38,8 @@ import datetime
 import ctypes
 from marga_pulseq.interpreter import PSInterpreter
 import pypulseq as pp
-from marge.marge_tyger import tyger_denoising_tep, tyger_denoising_local, tyger_rare
+# Tyger modules are imported lazily inside sequenceAnalysis() because
+# tyger_denoising_tep and tyger_denoising_local may not exist in all versions.
 import marge.marge_tyger.tyger_config as tyger_conf
 
 #*********************************************************************************
@@ -1718,6 +1719,7 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
             n += 1
 
         ## Tyger Reconstruction
+        from marge.marge_tyger import tyger_denoising_tep, tyger_denoising_local, tyger_rare
         out_field = 'image3D_den'
         out_field_k = 'kSpace3D_den'
         result_Tyger = None
