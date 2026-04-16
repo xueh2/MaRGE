@@ -166,8 +166,8 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
                           tip="'both': undersample phase and slice. 'phase': phase only. 'slice': slice only.")
         self.addParameter(key='calibrationSize', string='Calibration region size', val=16, field='SEQ',
                           tip='Size of fully-sampled calibration region (lines) at k-space center')
-        self.addParameter(key='smoothTrajectory', string='Smooth k-space trajectory', val=1, field='SEQ',
-                          tip='0: distance-sorted ordering. 1: nearest-neighbor smoothing to minimize gradient jumps.')
+        self.addParameter(key='smoothTrajectory', string='Smooth k-space trajectory', val=2, field='SEQ',
+                          tip='0: distance-sorted. 1: greedy NN. 2: NN + 2-opt (best). 3: distance-sorted within trains + inter-train smoothing.')
 
         self.acq = ismrmrd.Acquisition()
         self.img = ismrmrd.Image()
@@ -416,6 +416,84 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
         fa_train = np.clip(fa_train, 1.0, 180.0)
         return fa_train
 
+    def _smooth_train_2opt(self, pts, _ph_s, _sl_s):
+        """
+        Smooth within-train trajectory using multi-start greedy NN + 2-opt.
+
+        Uses a lexicographic bottleneck objective:
+        1. Primary: minimize the maximum single step (worst gradient transient)
+        2. Secondary: minimize total squared path distance
+
+        Index 0 (center-most point) is always pinned.
+
+        Args:
+            pts: List of (ph, sl, dist) tuples for one echo train.
+            _ph_s: Phase scaling factor for distance metric.
+            _sl_s: Slice scaling factor for distance metric.
+
+        Returns:
+            list: Reordered list of (ph, sl, dist) tuples.
+        """
+        n = len(pts)
+        if n <= 2:
+            return sorted(pts, key=lambda x: x[2])
+
+        pts = sorted(pts, key=lambda x: x[2])
+
+        def _dsq(a, b):
+            return ((a[0] - b[0]) * _ph_s) ** 2 + ((a[1] - b[1]) * _sl_s) ** 2
+
+        def _path_cost(path):
+            """Returns (max_step_sq, total_sq) for lexicographic comparison."""
+            max_sq = 0.0
+            total_sq = 0.0
+            for k in range(len(path) - 1):
+                d = _dsq(path[k], path[k + 1])
+                total_sq += d
+                if d > max_sq:
+                    max_sq = d
+            return (max_sq, total_sq)
+
+        def _greedy_nn(first, second):
+            """Build path with pinned first point and chosen second point."""
+            ordered = [pts[first], pts[second]]
+            remaining = set(range(n)) - {first, second}
+            while remaining:
+                last = ordered[-1]
+                best = min(remaining, key=lambda r: _dsq(last, pts[r]))
+                ordered.append(pts[best])
+                remaining.remove(best)
+            return ordered
+
+        # Phase 1: Multi-start greedy NN
+        n_starts = min(8, n - 1)
+        candidates = sorted(range(1, n), key=lambda r: _dsq(pts[0], pts[r]))[:n_starts]
+
+        best_path = None
+        best_cost = (float('inf'), float('inf'))
+
+        for second in candidates:
+            path = _greedy_nn(0, second)
+            cost = _path_cost(path)
+            if cost < best_cost:
+                best_cost = cost
+                best_path = path
+
+        # Phase 2: 2-opt local search (index 0 pinned)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(1, n - 1):
+                for j in range(i + 1, n):
+                    new_path = best_path[:i] + best_path[i:j + 1][::-1] + best_path[j + 1:]
+                    new_cost = _path_cost(new_path)
+                    if new_cost < best_cost:
+                        best_path = new_path
+                        best_cost = new_cost
+                        improved = True
+
+        return best_path
+
     def computeVariableDensityOrdering(self, n_ph, n_sl, etl, mask=None):
         """
         Compute a 2D variable-density k-space ordering over the phase-slice plane.
@@ -489,8 +567,13 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
             _ph_s = 1.0
             _sl_s = 1.0
 
-        if self.smoothTrajectory:
-            # --- Step 1: Smooth within-train trajectory ---
+        if self.smoothTrajectory >= 2:
+            # --- Step 1: Smooth within-train using NN + 2-opt ---
+            for t in range(n_trains):
+                trains[t] = self._smooth_train_2opt(trains[t], _ph_s, _sl_s)
+
+        elif self.smoothTrajectory == 1:
+            # --- Step 1: Smooth within-train using greedy NN ---
             # Greedy nearest-neighbor path starting from center-most point.
             # Preserves center-out start, minimizes jumps between consecutive echoes.
             for t in range(n_trains):
@@ -515,34 +598,34 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
                     remaining.remove(best_idx)
                 trains[t] = ordered
 
-            # --- Step 2: Order trains to minimize inter-train jumps ---
-            # Cost = sum of squared distances between same-echo-index positions.
-            # Greedy nearest-neighbor on the train sequence.
-            if n_trains > 2:
-                def _train_cost(t_a, t_b):
-                    cost = 0.0
-                    for e in range(min(len(trains[t_a]), len(trains[t_b]))):
-                        dph = (trains[t_a][e][0] - trains[t_b][e][0]) * _ph_s
-                        dsl = (trains[t_a][e][1] - trains[t_b][e][1]) * _sl_s
-                        cost += dph * dph + dsl * dsl
-                    return cost
-
-                remaining_t = set(range(n_trains))
-                first = min(range(n_trains), key=lambda t: trains[t][0][2])
-                train_order = [first]
-                remaining_t.remove(first)
-
-                while remaining_t:
-                    last = train_order[-1]
-                    best_t = min(remaining_t, key=lambda t: _train_cost(last, t))
-                    train_order.append(best_t)
-                    remaining_t.remove(best_t)
-
-                trains = [trains[t] for t in train_order]
         else:
             # Simple distance-sorted ordering (original behavior)
             for train in trains:
                 train.sort(key=lambda x: x[2])
+
+        # --- Step 2: Order trains to minimize inter-train jumps ---
+        # Shared by modes 1 and 2. Greedy nearest-neighbor on train sequence.
+        if self.smoothTrajectory >= 1 and n_trains > 2:
+            def _train_cost(t_a, t_b):
+                cost = 0.0
+                for e in range(min(len(trains[t_a]), len(trains[t_b]))):
+                    dph = (trains[t_a][e][0] - trains[t_b][e][0]) * _ph_s
+                    dsl = (trains[t_a][e][1] - trains[t_b][e][1]) * _sl_s
+                    cost += dph * dph + dsl * dsl
+                return cost
+
+            remaining_t = set(range(n_trains))
+            first = min(range(n_trains), key=lambda t: trains[t][0][2])
+            train_order = [first]
+            remaining_t.remove(first)
+
+            while remaining_t:
+                last = train_order[-1]
+                best_t = min(remaining_t, key=lambda t: _train_cost(last, t))
+                train_order.append(best_t)
+                remaining_t.remove(best_t)
+
+            trains = [trains[t] for t in train_order]
 
         # Flatten: train 0 echoes, train 1 echoes, ...
         ordering = []
