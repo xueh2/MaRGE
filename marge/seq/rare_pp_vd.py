@@ -157,7 +157,8 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
                           tip='Number of constant-FA echoes before decay (ConstantThenDecay mode)')
         # Variable Density parameters
         self.addParameter(key='densityMode', string='K-space density', val='Uniform', field='SEQ',
-                          tip="'Uniform': standard. 'CenterOut': 2D center-out. 'EllipticalCenterOut': elliptical center-out.")
+                          tip="'Uniform': standard. 'CenterOut': 2D center-out. 'EllipticalCenterOut': elliptical center-out. "
+                              "'LinearCenterOut': center-out along k_phase within each train; trains traverse k_slice center-out.")
         self.addParameter(key='accelerationFactor', string='Acceleration factor', val=1.0, field='SEQ',
                           tip='Undersampling acceleration (1.0 = fully sampled)')
         self.addParameter(key='undersamplingType', string='Undersampling type', val='None', field='SEQ',
@@ -526,6 +527,66 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
                 for ph_idx_ordered in ind:
                     if mask is None or mask[ph_idx_ordered, sl_idx]:
                         ordering.append((ph_idx_ordered, sl_idx))
+            return ordering
+
+        if mode == 'LinearCenterOut':
+            # Linear ordering optimized for any mask:
+            #   - Echo index within a train is strictly center-out in k_phase:
+            #     echo e is the e-th closest to k_phase center among the train's
+            #     echoes (global ranking across all acquired points).
+            #   - Successive trains have monotonically increasing mean k_slice.
+            #   - Works for any mask (fully sampled or undersampled), covering
+            #     every acquired point exactly once.
+            #
+            # Algorithm:
+            #   1. Collect all acquired (ph, sl) points.
+            #   2. Sort globally by |ph - ph_center| ascending (ties: smaller
+            #      |sl - sl_center| first, then ph then sl for determinism).
+            #      This gives a center-out ranking.
+            #   3. Form T = ceil(N / etl) trains by splitting the sorted list
+            #      into etl "echo buckets" of T points each: bucket 0 holds
+            #      the T most-central-k_phase points, bucket 1 the next T, etc.
+            #   4. Within each echo bucket, sort by k_slice ascending and
+            #      assign the t-th point to train t. This guarantees the mean
+            #      k_slice of train t is monotonically non-decreasing.
+            #   5. Emit trains 0..T-1, each listing echoes from bucket 0, 1, ...
+            ph_center = (n_ph - 1) / 2.0
+            sl_center = (n_sl - 1) / 2.0
+
+            pts = []
+            for sl_idx in range(n_sl):
+                for ph_idx in range(n_ph):
+                    if mask is not None and not mask[ph_idx, sl_idx]:
+                        continue
+                    pts.append((ph_idx, sl_idx))
+            if not pts:
+                return []
+
+            pts.sort(key=lambda x: (abs(x[0] - ph_center),
+                                    abs(x[1] - sl_center),
+                                    x[0], x[1]))
+
+            n_total = len(pts)
+            n_trains = int(np.ceil(n_total / etl))
+
+            # Split into echo buckets of up to n_trains points each.
+            buckets = []
+            for e in range(etl):
+                start = e * n_trains
+                if start >= n_total:
+                    break
+                end = min(start + n_trains, n_total)
+                bucket = pts[start:end]
+                # Sort within the bucket by k_slice ascending (ties: k_phase)
+                bucket.sort(key=lambda x: (x[1], x[0]))
+                buckets.append(bucket)
+
+            # Emit trains: train t picks the t-th point from each bucket.
+            ordering = []
+            for t in range(n_trains):
+                for bucket in buckets:
+                    if t < len(bucket):
+                        ordering.append(bucket[t])
             return ordering
 
         # Build all (ph, sl) pairs with their distance to center

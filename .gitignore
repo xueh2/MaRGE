@@ -38,3 +38,4 @@ sequence.seq
 *.csv
 marge/logs/
 uv.lock
+marge/visualization
