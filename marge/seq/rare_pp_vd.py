@@ -2014,22 +2014,74 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
         encoding.trajectory = ismrmrd.xsd.trajectoryType.CARTESIAN
         #encoding.trajectory =ismrmrd.xsd.trajectoryType[data.processing.trajectory.upper()]
 
+        # -------------------------------------------------------------
+        # Embedded calibration (MRD calibrationMode="embedded") support
+        # -------------------------------------------------------------
+        # When the acquisition is undersampled (accelerationFactor > 1 or
+        # an undersampling pattern is selected) the fully-sampled central
+        # block defined by `calibrationSize` is reused as ACS data and the
+        # MRD file declares this via parallelImaging.calibrationMode and
+        # the per-line ACQ_IS_PARALLEL_CALIBRATION_AND_IMAGING flag.
+        accel = float(self.mapVals.get('accelerationFactor', 1.0))
+        us_type = self.mapVals.get('undersamplingType', 'None')
+        us_axis = self.mapVals.get('undersamplingAxis', 'both')
+        is_embedded = (accel > 1.0) or (us_type not in (None, 'None'))
+
+        if is_embedded:
+            pi = ismrmrd.xsd.parallelImagingType()
+            af = ismrmrd.xsd.accelerationFactorType()
+            af.kspace_encoding_step_1 = int(round(accel)) if us_axis in ('both', 'phase') else 1
+            af.kspace_encoding_step_2 = int(round(accel)) if us_axis in ('both', 'slice') else 1
+            pi.accelerationFactor = af
+            pi.calibrationMode = ismrmrd.xsd.calibrationModeType.EMBEDDED
+            # interleavingDimension is required only when calibrationMode is "interleaved"
+            encoding.parallelImaging = pi
+
+            # Stash calibrationSize in userParameters (no dedicated schema field)
+            if self.header.userParameters is None:
+                self.header.userParameters = ismrmrd.xsd.userParametersType()
+            self.header.userParameters.userParameterLong.append(
+                ismrmrd.xsd.userParameterLongType(
+                    name='calibrationSize', value=int(self.calibrationSize)))
+
+        # Ensure encoding is actually attached to the header before serialising
+        # (it was previously created locally but never appended).
+        if encoding not in list(self.header.encoding):
+            self.header.encoding.append(encoding)
+
         dset.write_xml_header(self.header.toXML()) # Write the header to the dataset
 
         new_data = np.zeros((n_ph * n_sl * self.nScans, n_rd + 2*self.add_rd_points))
         new_data = np.reshape(self.data_fullmat, (self.nScans, n_sl, n_ph, n_rd+ 2*self.add_rd_points))
 
-        counter=0
-        for scan in range(self.nScans):
-            for slice_idx in range(n_sl):
-                for phase_idx in range(n_ph):
+        # ACS (calibration) region helper: matches generateUndersamplingMask
+        # which slices mask[c - calib_half : c + calib_half] (half-open).
+        ph_center_idx = n_ph // 2
+        sl_center_idx = n_sl // 2
+        calib_half_ph = min(int(self.calibrationSize) // 2, n_ph // 2)
+        calib_half_sl = min(int(self.calibrationSize) // 2, n_sl // 2)
+        def _is_calibration(ph_idx, sl_idx):
+            return (ph_center_idx - calib_half_ph <= ph_idx < ph_center_idx + calib_half_ph
+                    and sl_center_idx - calib_half_sl <= sl_idx < sl_center_idx + calib_half_sl)
 
-                    line = new_data[scan, slice_idx, phase_idx, :]
-                    line2d = np.reshape(line, (1, n_rd+2*self.add_rd_points))
+        counter=0
+        if is_embedded:
+            vd_ordering = self.mapVals.get('vd_ordering', None)
+            if vd_ordering is None:
+                raise RuntimeError(
+                    "save_ismrmrd: is_embedded=True but mapVals['vd_ordering'] is missing; "
+                    "VD sequence did not record its ordering.")
+            for scan in range(self.nScans):
+                for line_idx, (ph_idx, sl_idx) in enumerate(vd_ordering):
+                    ph_idx = int(ph_idx)
+                    sl_idx = int(sl_idx)
+
+                    line = new_data[scan, sl_idx, ph_idx, :]
+                    line2d = np.reshape(line, (1, n_rd + 2 * self.add_rd_points))
                     acq = ismrmrd.Acquisition.from_array(line2d, None)
 
-                    index_in_repetition = phase_idx % etl
-                    current_repetition = (phase_idx // etl) + (slice_idx * (n_ph // etl))
+                    index_in_repetition = line_idx % etl
+                    current_repetition = line_idx // etl
 
                     acq.clearAllFlags()
 
@@ -2038,49 +2090,108 @@ class RarePyPulseqVD(blankSeq.MRIBLANKSEQ):
                     elif index_in_repetition == etl - 1:
                         acq.setFlag(ismrmrd.ACQ_LAST_IN_CONTRAST)
 
-                    if ind[phase_idx]== 0:
+                    if ph_idx == 0:
                         acq.setFlag(ismrmrd.ACQ_FIRST_IN_PHASE)
-                    elif ind[phase_idx] == n_ph - 1:
+                    elif ph_idx == n_ph - 1:
                         acq.setFlag(ismrmrd.ACQ_LAST_IN_PHASE)
 
-                    if slice_idx == 0:
+                    if sl_idx == 0:
                         acq.setFlag(ismrmrd.ACQ_FIRST_IN_SLICE)
-                    elif slice_idx == n_sl - 1:
+                    elif sl_idx == n_sl - 1:
                         acq.setFlag(ismrmrd.ACQ_LAST_IN_SLICE)
-
-                    if int(current_repetition) == 0:
-                        acq.setFlag(ismrmrd.ACQ_FIRST_IN_REPETITION)
-                    elif int(current_repetition) == nRep - 1:
-                        acq.setFlag(ismrmrd.ACQ_LAST_IN_REPETITION)
 
                     if scan == 0:
                         acq.setFlag(ismrmrd.ACQ_FIRST_IN_AVERAGE)
-                    elif scan == self.nScans-1:
+                    elif scan == self.nScans - 1:
                         acq.setFlag(ismrmrd.ACQ_LAST_IN_AVERAGE)
 
+                    # *** embedded ACS flag ***
+                    if _is_calibration(ph_idx, sl_idx):
+                        acq.setFlag(ismrmrd.ACQ_IS_PARALLEL_CALIBRATION_AND_IMAGING)
 
                     counter += 1
 
-                    # +1 to start at 1 instead of 0
-                    acq.idx.repetition = int(current_repetition + 1)
-                    acq.idx.kspace_encode_step_1 = ind[phase_idx]+1 # phase
-                    acq.idx.slice = slice_idx + 1
-                    acq.idx.contrast = index_in_repetition + 1
-                    acq.idx.average = scan + 1 # scan
+                    acq.idx.repetition           = int(current_repetition + 1)
+                    acq.idx.kspace_encode_step_1 = int(ph_idx + 1)
+                    acq.idx.kspace_encode_step_2 = int(sl_idx + 1)
+                    acq.idx.slice                = int(sl_idx + 1)
+                    acq.idx.contrast             = int(index_in_repetition + 1)
+                    acq.idx.average              = int(scan + 1)
 
                     acq.scan_counter = counter
                     acq.discard_pre = self.add_rd_points
                     acq.discard_post = self.add_rd_points
-                    acq.sample_time_us = 1/bw
+                    acq.sample_time_us = 1 / bw
                     self.dfov = np.array(self.dfov)
                     acq.position = (ctypes.c_float * 3)(*self.dfov.flatten())
-
-
                     acq.read_dir = (ctypes.c_float * 3)(*read_dir)
                     acq.phase_dir = (ctypes.c_float * 3)(*phase_dir)
                     acq.slice_dir = (ctypes.c_float * 3)(*slice_dir)
 
-                    dset.append_acquisition(acq) # Append the acquisition to the dataset
+                    dset.append_acquisition(acq)
+        else:
+            for scan in range(self.nScans):
+                for slice_idx in range(n_sl):
+                    for phase_idx in range(n_ph):
+
+                        line = new_data[scan, slice_idx, phase_idx, :]
+                        line2d = np.reshape(line, (1, n_rd+2*self.add_rd_points))
+                        acq = ismrmrd.Acquisition.from_array(line2d, None)
+
+                        index_in_repetition = phase_idx % etl
+                        current_repetition = (phase_idx // etl) + (slice_idx * (n_ph // etl))
+
+                        acq.clearAllFlags()
+
+                        if index_in_repetition == 0:
+                            acq.setFlag(ismrmrd.ACQ_FIRST_IN_CONTRAST)
+                        elif index_in_repetition == etl - 1:
+                            acq.setFlag(ismrmrd.ACQ_LAST_IN_CONTRAST)
+
+                        if ind[phase_idx]== 0:
+                            acq.setFlag(ismrmrd.ACQ_FIRST_IN_PHASE)
+                        elif ind[phase_idx] == n_ph - 1:
+                            acq.setFlag(ismrmrd.ACQ_LAST_IN_PHASE)
+
+                        if slice_idx == 0:
+                            acq.setFlag(ismrmrd.ACQ_FIRST_IN_SLICE)
+                        elif slice_idx == n_sl - 1:
+                            acq.setFlag(ismrmrd.ACQ_LAST_IN_SLICE)
+
+                        if int(current_repetition) == 0:
+                            acq.setFlag(ismrmrd.ACQ_FIRST_IN_REPETITION)
+                        elif int(current_repetition) == nRep - 1:
+                            acq.setFlag(ismrmrd.ACQ_LAST_IN_REPETITION)
+
+                        if scan == 0:
+                            acq.setFlag(ismrmrd.ACQ_FIRST_IN_AVERAGE)
+                        elif scan == self.nScans-1:
+                            acq.setFlag(ismrmrd.ACQ_LAST_IN_AVERAGE)
+
+
+                        counter += 1
+
+                        # +1 to start at 1 instead of 0
+                        acq.idx.repetition = int(current_repetition + 1)
+                        acq.idx.kspace_encode_step_1 = ind[phase_idx]+1 # phase
+                        acq.idx.kspace_encode_step_2 = slice_idx + 1    # 3D slice encoding
+                        acq.idx.slice = slice_idx + 1
+                        acq.idx.contrast = index_in_repetition + 1
+                        acq.idx.average = scan + 1 # scan
+
+                        acq.scan_counter = counter
+                        acq.discard_pre = self.add_rd_points
+                        acq.discard_post = self.add_rd_points
+                        acq.sample_time_us = 1/bw
+                        self.dfov = np.array(self.dfov)
+                        acq.position = (ctypes.c_float * 3)(*self.dfov.flatten())
+
+
+                        acq.read_dir = (ctypes.c_float * 3)(*read_dir)
+                        acq.phase_dir = (ctypes.c_float * 3)(*phase_dir)
+                        acq.slice_dir = (ctypes.c_float * 3)(*slice_dir)
+
+                        dset.append_acquisition(acq) # Append the acquisition to the dataset
 
 
         image=self.mapVals['image3D']
