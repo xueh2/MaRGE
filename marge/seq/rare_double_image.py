@@ -35,7 +35,7 @@ import pypulseq as pp
 from marge.marge_utils import utils
 
 from marge.marge_tyger import tyger_rare
-from marge.marge_tyger import tyger_denoising_double
+from marge.marge_tyger import tyger_denoising_double_tep, tyger_denoising_double_local
 import marge.marge_tyger.tyger_config as tyger_conf
 
 #*********************************************************************************
@@ -290,7 +290,7 @@ class RareDoubleImage(blankSeq.MRIBLANKSEQ):
         n_rd_points_per_train = self.etl * n_rd
 
         # par_acq_lines in case par_acq_lines = 0
-        par_acq_lines = int(int(self.nPoints[2] * self.parFourierFraction) - self.nPoints[2] / 2)
+        par_acq_lines = int(np.round(self.nPoints[2] * self.parFourierFraction) - self.nPoints[2] // 2)
         self.mapVals['partialAcquisition'] = par_acq_lines
 
         # BW
@@ -332,7 +332,7 @@ class RareDoubleImage(blankSeq.MRIBLANKSEQ):
         sl_gradients = np.linspace(-sl_grad_amplitude, sl_grad_amplitude, num=n_sl, endpoint=False)
 
         # Now fix the number of slices to partially acquired k-space
-        n_sl = (int(self.nPoints[2] / 2) + par_acq_lines) * axes_enable[2] + (1 - axes_enable[2])
+        n_sl = (self.nPoints[2] // 2 + par_acq_lines) * axes_enable[2] + (1 - axes_enable[2])
         print("Number of acquired slices: %i" % n_sl)
 
         # Set phase vector to given sweep mode
@@ -820,6 +820,26 @@ class RareDoubleImage(blankSeq.MRIBLANKSEQ):
                                )
 
     def sequenceAnalysis(self, mode=None):
+        """
+        Process raw acquired data and compute the output images and metrics.
+
+        Reconstructs the image from k-space for both echo trains (odd and even),
+        computes SNR or other sequence-specific figures of merit, populates
+        output_dict with result arrays, and fills dicom_meta_data with the
+        relevant DICOM tags for saving.
+
+        When the Tyger SNRAware denoising pipeline is enabled, both echo-train
+        k-spaces are exported to MRD format and submitted to the Tyger platform
+        for GPU-accelerated double-TEP or local denoising. The denoised image
+        is then available for subsequent phase-error-based distortion correction
+        before final saving.
+
+        Args:
+            mode (str, optional): Processing mode selector (sequence-dependent). Defaults to None.
+
+        Returns:
+            tuple: (output_dict, dicom_meta_data) with processed results and metadata.
+        """
         super().sequenceAnalysis(mode=mode)
 
         # Get axes in strings
@@ -833,18 +853,28 @@ class RareDoubleImage(blankSeq.MRIBLANKSEQ):
             index = axesVals.index(val)
             axesStr[n] = axesKeys[index]
             n += 1
-            
+
         ## Tyger Reconstruction
         input_echoes = self.tyger_denoising_echoes
         out_field = 'image3D_den'
         out_field_k = 'kSpace3D_den'
         result_Tyger = None
+        denoising_ok = False
         if self.mapVals['axes_enable'] == [1, 1, 1] and self.tyger_denoising == 1:
             try:
                 rawData_path = self.directory_mat + '/' + self.file_name + '.mat'
-                imgTyger = tyger_denoising_double.denoisingTyger_double(rawData_path, out_field, out_field_k,
+                if tyger_conf.snraware_version == 'TEP':
+                    imgTyger = tyger_denoising_double_tep.denoisingTyger_double(rawData_path, out_field, out_field_k,
                                                                         input_echoes)
-                imageTyger = np.abs(imgTyger[0])
+                    imageTyger = np.abs(imgTyger[0])
+                elif tyger_conf.snraware_version == 'Local':
+                    imgTyger = tyger_denoising_double_local.denoisingTyger_double(rawData_path, out_field, out_field_k,
+                                                                        input_echoes)
+                    imageTyger = np.abs(np.squeeze(imgTyger))
+                else:
+                    print('Denoising not available for snrawre_version = None')
+                    imgTyger = None
+
                 imageTyger = imageTyger / np.max(np.reshape(imageTyger, -1)) * 100
 
                 ## Image plot
@@ -857,20 +887,21 @@ class RareDoubleImage(blankSeq.MRIBLANKSEQ):
                 else:
                     result_Tyger = {'widget': 'image', 'data': imageTyger, 'xLabel': "%s" % axesStr[1],
                                     'yLabel': "%s" % axesStr[0], 'title': "Tyger", 'row': 0, 'col': 1}
+                denoising_ok = True
             except Exception as e:
                 print('Tyger reconstruction failed.')
                 print(f'Error: {e}')
-                
+
         if self.mapVals['axes_enable'] == [1, 1, 1] and self.tyger_recon == 1:
-            if self.tyger_denoising == 1:
-                if input_echoes == 'even': 
+            if self.tyger_denoising == 1 and denoising_ok:
+                if input_echoes == 'even':
                     input_field = out_field_k + '_even'
-                elif input_echoes == 'odd': 
+                elif input_echoes == 'odd':
                     input_field = out_field_k + '_odd'
-                elif input_echoes == 'all': 
+                elif input_echoes == 'all':
                     input_field = out_field_k + '_all'
             else:
-                input_field =''
+                input_field = ''
                 
             if self.full_plot == 'False' or self.full_plot is False:
                 print('Preparing Tyger enviroment...')

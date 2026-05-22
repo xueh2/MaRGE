@@ -8,6 +8,7 @@ Created on Thu June 2, 2022
 import os
 import sys
 
+
 #*****************************************************************************
 # Get the directory of the current script
 main_directory = os.path.dirname(os.path.realpath(__file__))
@@ -36,9 +37,8 @@ import datetime
 import ctypes
 from marga_pulseq.interpreter import PSInterpreter
 import pypulseq as pp
-from marge.marge_tyger import tyger_rare
+from marge.marge_tyger import tyger_denoising_tep, tyger_denoising_local, tyger_rare
 import marge.marge_tyger.tyger_config as tyger_conf
-from marge.marge_tyger import tyger_denoising
 
 #*********************************************************************************
 #*********************************************************************************
@@ -121,7 +121,7 @@ class RarePyPulseq(blankSeq.MRIBLANKSEQ):
                           tip="'ZP': Zero Padding, 'POCS': Projection Onto Convex Sets")
         self.addParameter(key='tyger_recon', string='Tyger reconstruction', val=0, field='PRO',
                           tip='To reconstruct with Tyger (0 = Disabled; 1 = Enabled)')
-        self.addParameter(key='tyger_denoising', string='Denoising (SNRAware)', val=0, field='PRO',
+        self.addParameter(key='tyger_denoising', string='Denoising (SNRAware TEP)', val=0, field='PRO',
                           tip='To denoising with Tyger (0 = Disabled; 1 = Enabled)')
         self.addParameter(key='recon_type', string='Reconstruction type', val='cp', field='PRO',
                           tip='Options: cp or artpk.')
@@ -288,7 +288,7 @@ class RarePyPulseq(blankSeq.MRIBLANKSEQ):
         n_rd_points_per_train = self.etl * n_rd
 
         # par_acq_lines in case par_acq_lines = 0
-        par_acq_lines = int(int(self.nPoints[2]*self.parFourierFraction)-self.nPoints[2]/2)
+        par_acq_lines = int(np.round(self.nPoints[2]*self.parFourierFraction)-self.nPoints[2]//2)
         self.mapVals['partialAcquisition'] = par_acq_lines
 
         # BW
@@ -327,7 +327,7 @@ class RarePyPulseq(blankSeq.MRIBLANKSEQ):
         sl_gradients = np.linspace(-sl_grad_amplitude,sl_grad_amplitude,num=n_sl,endpoint=False)
 
         # Now fix the number of slices to partially acquired k-space
-        n_sl = (int(self.nPoints[2]/2)+par_acq_lines)*axes_enable[2]+(1-axes_enable[2])
+        n_sl = (self.nPoints[2]//2+par_acq_lines)*axes_enable[2]+(1-axes_enable[2])
         print("Number of acquired slices: %i" % n_sl)
 
         # Set phase vector to given sweep mode
@@ -977,6 +977,24 @@ class RarePyPulseq(blankSeq.MRIBLANKSEQ):
                                )
 
     def sequenceAnalysis(self, mode=None):
+        """
+        Process raw acquired data and compute the output images and metrics.
+
+        Reconstructs the image from k-space, computes SNR or other sequence-specific
+        figures of merit, populates output_dict with result arrays, and fills
+        dicom_meta_data with the relevant DICOM tags for saving.
+
+        When the Tyger SNRAware denoising pipeline is enabled, the acquired k-space
+        is exported to MRD format and submitted to the Tyger platform for GPU-accelerated
+        TEP or local denoising. The denoised image is then available for subsequent
+        phase-error-based distortion correction before final saving.
+
+        Args:
+            mode (str, optional): Processing mode selector (sequence-dependent). Defaults to None.
+
+        Returns:
+            tuple: (output_dict, dicom_meta_data) with processed results and metadata.
+        """
         super().sequenceAnalysis(mode=mode)
 
         # Get axes in strings
@@ -998,8 +1016,16 @@ class RarePyPulseq(blankSeq.MRIBLANKSEQ):
         if self.mapVals['axes_enable'] == [1,1,1] and self.tyger_denoising == 1:
             try:
                 rawData_path = self.directory_mat + '/' + self.file_name+'.mat'
-                imgTyger = tyger_denoising.denoisingTyger(rawData_path, out_field, out_field_k)
-                imageTyger = np.abs(imgTyger[0])
+                if tyger_conf.snraware_version == 'TEP':
+                    imgTyger = tyger_denoising_tep.denoisingTyger(rawData_path, out_field, out_field_k)
+                    imageTyger = np.abs(imgTyger[0])
+                elif tyger_conf.snraware_version == 'Local':
+                    imgTyger = tyger_denoising_local.denoisingTyger(rawData_path, out_field, out_field_k)
+                    imageTyger = np.abs(np.squeeze(imgTyger))
+                else:
+                    print('Denoising not available for snrawre_version = None')
+                    imgTyger = None
+
                 imageTyger = imageTyger/np.max(np.reshape(imageTyger,-1))*100
 
                 ## Image plot

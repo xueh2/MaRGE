@@ -1,3 +1,5 @@
+"""Controller for the Tyger reconstruction workflow."""
+
 import sys
 import threading
 import numpy as np
@@ -9,8 +11,8 @@ try:
 except ImportError:
     pass
 from marge.marge_tyger import tyger_rare
-from marge.marge_tyger import tyger_denoising
-from marge.marge_tyger import tyger_denoising_double
+from marge.marge_tyger import tyger_denoising_tep
+from marge.marge_tyger import tyger_denoising_double_tep
 import marge.marge_tyger.tyger_config as tyger_conf
 from marge.marge_tyger import tyger_petra
 
@@ -49,7 +51,7 @@ class TygerTabController(TygerTabWidget):
                 input_field = self.main.tyger_denoising
                 output_field = output_field + '_den'
             except:
-                input_field = ''
+                input_field = None
             try:
                 imgTyger = tyger_rare.reconTygerRARE(rawData_path, recon_type, boFit_path, sign_rarepp, output_field, input_field)
                 imageTyger = np.abs(imgTyger[0])
@@ -104,6 +106,13 @@ class TygerTabController(TygerTabWidget):
         thread.start()
 
     def snraware_recon(self):
+        """
+        Run the SNRAware denoising reconstruction in the current thread.
+
+        Selects the appropriate Tyger denoising pipeline (single-echo or
+        double-echo TEP) based on the active sequence name, submits the
+        job, and updates the image view widget with the denoised result.
+        """
         if self.main.seq_name == 'RarePyPulseq' or self.main.seq_name == 'RareDoubleImage':
             rawData_path = self.main.file_path
             out_field = 'post_image3D_den'
@@ -111,7 +120,7 @@ class TygerTabController(TygerTabWidget):
             if self.main.seq_name == 'RareDoubleImage':
                 try:
                     input_echoes = self.snraware_double.currentText()
-                    imgTyger = tyger_denoising_double.denoisingTyger_double(rawData_path, out_field, out_field_k, input_echoes)
+                    imgTyger = tyger_denoising_double_tep.denoisingTyger_double(rawData_path, out_field, out_field_k, input_echoes)
                     imageTyger = np.abs(imgTyger[0])
                     imageTyger = imageTyger/np.max(np.reshape(imageTyger,-1))*100
                     if input_echoes == 'even': 
@@ -134,7 +143,7 @@ class TygerTabController(TygerTabWidget):
                     print(f'Error: {e}')
             elif self.main.seq_name == 'RarePyPulseq':
                 try:
-                    imgTyger = tyger_denoising.denoisingTyger(rawData_path, out_field, out_field_k)
+                    imgTyger = tyger_denoising_tep.denoisingTyger(rawData_path, out_field, out_field_k)
                     imageTyger = np.abs(imgTyger[0])
                     imageTyger = imageTyger/np.max(np.reshape(imageTyger,-1))*100
                     self.main.tyger_denoising = out_field_k
