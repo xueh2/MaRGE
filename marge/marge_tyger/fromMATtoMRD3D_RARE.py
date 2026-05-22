@@ -80,6 +80,36 @@ def matToMRD(input, output_file, input_field=None):
     print(f"acqTime: {acqTime}, bw: {bw}, dwell: {dwell}")
     print(f"parFourierFraction: {parFourierFraction}, partialAcquisition: {partialAcquisition}")
 
+    # --- VD / undersampling metadata (all optional; absent -> plain RARE) ---
+    def _scalar(name, default):
+        if name in mat_data:
+            try:
+                return mat_data[name].item()
+            except Exception:
+                return default
+        return default
+
+    accel_factor = float(_scalar('accelerationFactor', 1.0))
+    us_type      = str(_scalar('undersamplingType',  'None'))
+    us_axis      = str(_scalar('undersamplingAxis',  'both')).lower()
+    density_mode = str(_scalar('densityMode',        'Uniform'))
+    calib_size   = int(_scalar('calibrationSize',    0))
+
+    vd_ordering, has_vd = None, False
+    if 'vd_ordering' in mat_data:
+        vd = mat_data['vd_ordering']
+        if vd.ndim == 1:
+            vd = vd.reshape(-1, 2)
+        vd_ordering = [(int(r[0]), int(r[1])) for r in vd]
+        has_vd = True
+
+    is_embedded = has_vd or accel_factor > 1.0 or us_type not in ('None', '')
+
+    if is_embedded:
+        print(f"Embedded undersampling detected: accel={accel_factor}, "
+              f"type={us_type}, axis={us_axis}, density={density_mode}, "
+              f"calibrationSize={calib_size}, has_vd={has_vd}")
+
     # Signal vector
     # sampledCartesian is a 4-D array with the following columns: kx, ky, kz, signal. The rows are ordered according to the acquisition order (rd, ph, sl)
     sampledCartesian = mat_data['sampledCartesian']
@@ -191,13 +221,22 @@ def matToMRD(input, output_file, input_field=None):
     enc.encoding_limits.set = mrd.LimitType(minimum=0, maximum=0, center=0)
     enc.encoding_limits.segment = mrd.LimitType(minimum=0, maximum=0, center=0)
 
+    if is_embedded:
+        pi = mrd.ParallelImagingType()
+        pi.calibration_mode = mrd.CalibrationMode.EMBEDDED
+        af = mrd.AccelerationFactorType()
+        af.kspace_encoding_step_1 = (
+            int(round(accel_factor)) if us_axis in ('both', 'phase') else 1)
+        af.kspace_encoding_step_2 = (
+            int(round(accel_factor)) if us_axis in ('both', 'slice') else 1)
+        pi.acceleration_factor = af
+        enc.parallel_imaging = pi
+
     h.encoding.append(enc)
 
     readout_gradient = mrd.UserParameterDoubleType()
     readout_gradient.name = "readout_gradient_intensity"
-    #readout_gradient.value = rdGradAmplitude
     readout_gradient.value = float(np.squeeze(rdGradAmplitude).item())
-
 
     axes_param = mrd.UserParameterStringType()
     axes_param.name = "axesOrientation"
@@ -212,6 +251,28 @@ def matToMRD(input, output_file, input_field=None):
     h.user_parameters.user_parameter_double.append(readout_gradient)
     h.user_parameters.user_parameter_string.append(axes_param)
     h.user_parameters.user_parameter_string.append(d_fov)
+
+    if is_embedded:
+        accel_param = mrd.UserParameterDoubleType()
+        accel_param.name = "accelerationFactor"
+        accel_param.value = accel_factor
+        h.user_parameters.user_parameter_double.append(accel_param)
+
+        density_param = mrd.UserParameterStringType()
+        density_param.name = "densityMode"
+        density_param.value = density_mode
+        h.user_parameters.user_parameter_string.append(density_param)
+
+        us_type_param = mrd.UserParameterStringType()
+        us_type_param.name = "undersamplingType"
+        us_type_param.value = us_type
+        h.user_parameters.user_parameter_string.append(us_type_param)
+
+        if calib_size > 0:
+            cs_param = mrd.UserParameterLongType()
+            cs_param.name = "calibrationSize"
+            cs_param.value = calib_size
+            h.user_parameters.user_parameter_long.append(cs_param)
 
     print(f"mrd header: {h}")
 
@@ -260,20 +321,48 @@ def matToMRD(input, output_file, input_field=None):
             noise.data[:] = data_noise[n, :]
             yield mrd.StreamItem.Acquisition(noise)
 
+        n_ph, n_sl = nPoints[1], nPoints[2]
+        ph_center = (n_ph - 1) / 2.0
+        sl_center = (n_sl - 1) / 2.0
+        calib_half = calib_size // 2
+
+        def _is_calibration(ph, sl):
+            return (calib_half > 0
+                    and abs(ph - ph_center) < calib_half
+                    and abs(sl - sl_center) < calib_half)
+
+        if has_vd:
+            ph_set = sorted({p for p, _ in vd_ordering})
+            sl_set = sorted({s for _, s in vd_ordering})
+            first_ph, last_ph = ph_set[0], ph_set[-1]
+            first_sl, last_sl = sl_set[0], sl_set[-1]
+        else:
+            first_ph, last_ph = 0, n_ph - 1
+            first_sl, last_sl = 0, n_sl - 1
+
         for s in range(nPoints[2]):
             for line in range(nPoints[1]):
+
+                # Skip unacquired VD lines (zero-filled in k-space)
+                if has_vd and np.abs(kSpace[0, s, line, :]).sum() == 0:
+                    continue
 
                 num = (line + s * nPoints[1])
 
                 acq.head.flags = mrd.AcquisitionFlags(0)
-                if line == 0:
+                if line == first_ph:
                     acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_ENCODE_STEP_1
-                    acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_SLICE
                     acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
-                if line == nPoints[1] - 1:
+                if line == last_ph:
                     acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_ENCODE_STEP_1
-                    acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_SLICE
                     acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
+                if s == first_sl:
+                    acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_SLICE
+                if s == last_sl:
+                    acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_SLICE
+
+                if is_embedded and _is_calibration(line, s):
+                    acq.head.flags |= mrd.AcquisitionFlags.IS_PARALLEL_CALIBRATION_AND_IMAGING
 
                 acq.head.scan_counter = num + nNoise
 

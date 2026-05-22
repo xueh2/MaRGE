@@ -37,5 +37,7 @@ sequence.seq
 *.rar
 *.csv
 marge/logs/
+uv.lock
+marge/visualization
 .venv/
 *.pyc
